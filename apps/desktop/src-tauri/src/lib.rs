@@ -2594,6 +2594,10 @@ impl DesktopTaskRunner {
                         // Best-effort reindex; a recall-cache failure must not fail
                         // the consolidation pass itself.
                         let _ = index.reindex(&memory.all_chunks());
+                        // Record supersession edges after reindex (#1293).
+                        for (from, to) in &report.superseded {
+                            let _ = index.record_link(from, to, "supersession");
+                        }
                     }
                     ff_memory::Result::Ok(())
                 })

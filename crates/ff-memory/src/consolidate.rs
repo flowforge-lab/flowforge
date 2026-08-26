@@ -265,6 +265,12 @@ pub struct ConsolidationReport {
     pub bytes_before: usize,
     /// Curated file size after the pass (== `bytes_before` when `!ran`).
     pub bytes_after: usize,
+    /// Supersession edges detected this pass (memory sifting C1, #1293): each
+    /// `(from_key, to_key)` says the curated chunk `from_key` was superseded by
+    /// the freshly promoted curated chunk `to_key` (same heading, changed text).
+    /// The caller records these into `chunk_links` after reindex, once both keys
+    /// are live. Empty unless a promotion superseded exactly one same-heading fact.
+    pub superseded: Vec<(String, String)>,
 }
 
 /// Map a chunk's (stripped) heading to a canonical [`Stratum`], if it is one.
@@ -482,6 +488,24 @@ impl crate::Memory {
         let mut curated = kept;
         let curated_keys: HashSet<String> = curated.iter().map(content_key).collect();
 
+        // Supersession detection (memory sifting C1, #1293). Map each distinctive
+        // heading to the curated chunk keys under it, so a promotion whose heading
+        // matches exactly one existing curated fact can be recorded as superseding
+        // it. Canonical stratum headings (Identity/Patterns/Focus) are structural
+        // containers for bare bullets, not topics, so they are excluded -- only a
+        // distinctive sub-heading names "the same thing".
+        let mut curated_by_heading: HashMap<String, Vec<String>> = HashMap::new();
+        for c in &curated {
+            if let Some(h) = c.heading.as_deref() {
+                if stratum_for_heading(h).is_none() {
+                    curated_by_heading
+                        .entry(h.to_string())
+                        .or_default()
+                        .push(chunk_key(c));
+                }
+            }
+        }
+
         // --- Promote: recurring, recent daily facts not already curated. Pick
         //     the highest-scoring (freshest) copy per content key. ---
         let mut best: HashMap<String, (f32, MemoryChunk)> = HashMap::new();
@@ -506,6 +530,17 @@ impl crate::Memory {
         for key in promoted_keys {
             let (_, mut chunk) = best.remove(&key).unwrap();
             chunk.source = MemorySource::Curated;
+            // Supersession: if this promotion's heading matches exactly one
+            // existing curated fact (1:1 guard), record the old fact as superseded
+            // by the new one. Ambiguous headings (>1 curated chunk) are skipped --
+            // we cannot tell which was replaced, so never mis-record.
+            if let Some(h) = chunk.heading.as_deref() {
+                if let Some(olds) = curated_by_heading.get(h) {
+                    if olds.len() == 1 {
+                        report.superseded.push((olds[0].clone(), chunk_key(&chunk)));
+                    }
+                }
+            }
             curated.push(chunk);
             report.promoted += 1;
         }

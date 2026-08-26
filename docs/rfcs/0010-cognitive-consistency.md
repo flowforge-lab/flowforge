@@ -1,6 +1,6 @@
 # 0010 — Cognitive Consistency: Temporal Fact Tracking
 
-- **Status:** Proposed
+- **Status:** Proposed — **partially superseded in implementation** (see note below)
 - **Milestone:** _Open (see §11.1)_
 - **Author:** tonytan4ever
 - **Depends on:** RFC 0006 (Markdown source of truth, `MemoryChunk`, `chunk_key`,
@@ -8,6 +8,19 @@
   pattern, reinforcement/decay), RFC 0008 (strata headings as fact homes)
 - **Supersedes:** —
 - **Tracking issue:** _TBD_
+
+> **Implementation note (2026-08, #1293).** The "memory sifting + indexing" plan
+> lands supersession first, but via a **generic `chunk_links` edge table**
+> (`from_key, to_key, kind, created_at`) rather than this RFC's dedicated
+> `chunk_history` interval table. The edge table is shared with wiki-link and
+> co-occurrence edges (block C2, #1294), so it is the durable graph layer C
+> depends on. C1 (#1293) records `kind='supersession'` edges during consolidate
+> promotion, guarded by single-heading identity (1:1 heading match; ambiguous and
+> stratum-container headings are skipped). The `valid_from/valid_to/reason`
+> interval model and inspectability surface in §3–§8 below are **not** implemented
+> by C1; treat them as a possible future enrichment layered on the edge table, not
+> as the shipped design.
+
 
 ## 1. Summary & Goals
 

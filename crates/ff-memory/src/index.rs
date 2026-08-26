@@ -75,6 +75,15 @@ pub struct ChunkStatSnapshot {
     pub dormant: bool,
 }
 
+/// A directed edge in the `chunk_links` graph layer (memory sifting, #1293).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub from_key: String,
+    pub to_key: String,
+    pub kind: String,
+    pub created_at: i64,
+}
+
 /// Recall backend (RFC 0006 §6). Swappable so M5.3 can add a hybrid vector index
 /// behind the same seam; v1 ships [`Fts5Index`].
 pub trait MemoryIndex: Send + Sync {
@@ -229,6 +238,23 @@ pub trait MemoryIndex: Send + Sync {
     fn set_suppress_promotion(&self, _key: &str, _suppress: bool) -> Result<()> {
         Ok(())
     }
+    /// Record a directed edge between two chunks in the `chunk_links` graph layer
+    /// (memory sifting, #1293). `kind` names the relationship (`"supersession"`
+    /// in C1; `"wikilink"`/`"cooccur"` in C2). Idempotent on
+    /// `(from_key, to_key, kind)`. Unlike `chunk_stats`, edges describe *events*,
+    /// not current content, so they are never GC'd by `reindex`. The default is a
+    /// no-op so backends without the table need no change; [`Fts5Index`] overrides it.
+    fn record_link(&self, _from_key: &str, _to_key: &str, _kind: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Edges originating at `key` (i.e. `from_key = key`). The default is empty.
+    fn links_from(&self, _key: &str) -> Result<Vec<Link>> {
+        Ok(Vec::new())
+    }
+    /// Edges pointing at `key` (i.e. `to_key = key`). The default is empty.
+    fn links_to(&self, _key: &str) -> Result<Vec<Link>> {
+        Ok(Vec::new())
+    }
 }
 
 /// FTS5/BM25 index over a SQLite database. `open` on a path persists to disk;
@@ -302,7 +328,15 @@ impl Fts5Index {
                  similarity  REAL NOT NULL DEFAULT 1.0,
                  last_mapped INTEGER NOT NULL,
                  PRIMARY KEY (content_key, chunk_key)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS chunk_links (
+                 from_key   TEXT NOT NULL,
+                 to_key     TEXT NOT NULL,
+                 kind       TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (from_key, to_key, kind)
+             );
+             CREATE INDEX IF NOT EXISTS idx_chunk_links_to ON chunk_links(to_key);",
         )?;
         Self::ensure_embedding_column(&conn)?;
         Self::ensure_pinned_column(&conn)?;
@@ -634,6 +668,26 @@ impl Fts5Index {
         Ok(())
     }
 
+    /// Time-injectable core of [`record_link`](MemoryIndex::record_link) (#1293).
+    /// Inserts a directed edge, idempotent on `(from_key, to_key, kind)`;
+    /// a repeat refreshes `created_at` to the latest occurrence.
+    pub(crate) fn record_link_at(
+        &self,
+        from_key: &str,
+        to_key: &str,
+        kind: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chunk_links (from_key, to_key, kind, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(from_key, to_key, kind) DO UPDATE SET created_at = ?4",
+            params![from_key, to_key, kind, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Time-injectable core of
     /// [`reinforce_outcome`](MemoryIndex::reinforce_outcome). A success has two
     /// effects, both keyed to keep it symmetric with how suppression is applied
@@ -723,6 +777,25 @@ impl Fts5Index {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn query_links(&self, column: &str, key: &str) -> Result<Vec<Link>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT from_key, to_key, kind, created_at FROM chunk_links
+             WHERE {column} = ?1 ORDER BY created_at DESC, kind, from_key, to_key"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![key], |row| {
+            Ok(Link {
+                from_key: row.get(0)?,
+                to_key: row.get(1)?,
+                kind: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 }
 
@@ -1037,6 +1110,15 @@ impl MemoryIndex for Fts5Index {
     fn set_suppress_promotion(&self, key: &str, suppress: bool) -> Result<()> {
         self.set_suppress_promotion_at(key, suppress, Utc::now().timestamp_millis())
     }
+    fn record_link(&self, from_key: &str, to_key: &str, kind: &str) -> Result<()> {
+        self.record_link_at(from_key, to_key, kind, Utc::now().timestamp_millis())
+    }
+    fn links_from(&self, key: &str) -> Result<Vec<Link>> {
+        self.query_links("from_key", key)
+    }
+    fn links_to(&self, key: &str) -> Result<Vec<Link>> {
+        self.query_links("to_key", key)
+    }
 }
 
 /// Lazy exponential decay (RFC 0007 §2): `weight * factor^days`, where `days` is
@@ -1197,6 +1279,17 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn set_suppress_promotion(&self, key: &str, suppress: bool) -> Result<()> {
         self.inner.set_suppress_promotion(key, suppress)
+    }
+    fn record_link(&self, from_key: &str, to_key: &str, kind: &str) -> Result<()> {
+        self.inner.record_link(from_key, to_key, kind)
+    }
+
+    fn links_from(&self, key: &str) -> Result<Vec<Link>> {
+        self.inner.links_from(key)
+    }
+
+    fn links_to(&self, key: &str) -> Result<Vec<Link>> {
+        self.inner.links_to(key)
     }
 
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {

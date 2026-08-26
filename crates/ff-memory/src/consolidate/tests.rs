@@ -536,6 +536,62 @@ fn suppressed_daily_chunk_scores_zero() {
     );
 }
 
+// --- Supersession detection (memory sifting C1, #1293) ---
+
+#[test]
+fn consolidate_records_supersession_when_heading_uniquely_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    // One existing curated fact under a distinctive heading.
+    m.rewrite_curated("# Project\nold approach\n").unwrap();
+    // A recurring daily fact under the SAME heading, different text.
+    for n in 0..3 {
+        write_daily(&m, days_ago(n), "# Project\nnew approach\n");
+    }
+
+    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+
+    assert_eq!(report.promoted, 1);
+    assert_eq!(
+        report.superseded.len(),
+        1,
+        "the promotion supersedes the one same-heading curated fact"
+    );
+
+    // from = old curated key, to = new promoted (now-curated) key; they differ
+    // (different text) and are both curated-sourced.
+    let (old_key, new_key) = report.superseded[0].clone();
+    assert_ne!(old_key, new_key);
+    assert!(old_key.starts_with("curated:"), "from key: {old_key}");
+    assert!(new_key.starts_with("curated:"), "to key: {new_key}");
+
+    // Recording the edge (as the caller does) is queryable in both directions.
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.record_link(&old_key, &new_key, "supersession").unwrap();
+    assert_eq!(idx.links_from(&old_key).unwrap()[0].to_key, new_key);
+    assert_eq!(idx.links_to(&new_key).unwrap()[0].from_key, old_key);
+}
+
+#[test]
+fn consolidate_skips_supersession_when_heading_is_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    // TWO curated facts share the same heading -> cannot tell which is superseded.
+    m.rewrite_curated("# Notes\nfirst note\n\n# Notes\nsecond note\n")
+        .unwrap();
+    for n in 0..3 {
+        write_daily(&m, days_ago(n), "# Notes\nthird note\n");
+    }
+
+    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+
+    assert_eq!(report.promoted, 1);
+    assert!(
+        report.superseded.is_empty(),
+        "ambiguous heading (>1 curated chunk) must not mis-record a supersession"
+    );
+}
+
 #[test]
 fn suppression_does_not_affect_curated_demotion() {
     // Suppression is a promote-side gate; a curated chunk with the same key must
@@ -551,5 +607,25 @@ fn suppression_does_not_affect_curated_demotion() {
         s.score(&c, 1),
         0.8,
         "curated (demote) scoring ignores the promote-side suppress flag"
+    );
+}
+
+#[test]
+fn consolidate_skips_supersession_for_stratum_container_heading() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    // A canonical stratum heading is a structural container for bare bullets,
+    // not a topic; a promotion under it must not be treated as supersession.
+    m.rewrite_curated("## Focus\n- shipping C1\n").unwrap();
+    for n in 0..3 {
+        write_daily(&m, days_ago(n), "## Focus\n- shipping C2\n");
+    }
+
+    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+
+    assert_eq!(report.promoted, 1);
+    assert!(
+        report.superseded.is_empty(),
+        "stratum container heading is not a supersession signal"
     );
 }

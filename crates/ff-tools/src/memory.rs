@@ -542,7 +542,19 @@ impl Tool for MemoryConsolidateTool {
             "Consolidated: merged {}, promoted {}, demoted {} ({} -> {} bytes).",
             report.merged, report.promoted, report.demoted, report.bytes_before, report.bytes_after
         );
-        match tokio::task::spawn_blocking(move || index.reindex(&chunks)).await {
+        let superseded = report.superseded.clone();
+        match tokio::task::spawn_blocking(move || {
+            index.reindex(&chunks)?;
+            // Record supersession edges after reindex, when both endpoint keys are
+            // live in the rebuilt index (memory sifting C1, #1293). Edges describe
+            // events, so reindex never GCs them.
+            for (from, to) in &superseded {
+                index.record_link(from, to, "supersession")?;
+            }
+            Ok::<(), ff_memory::MemoryError>(())
+        })
+        .await
+        {
             Ok(Ok(())) => ToolOutcome::ok(summary),
             Ok(Err(e)) => ToolOutcome::ok(format!("{summary} (warning: reindex failed: {e})")),
             Err(e) => ToolOutcome::ok(format!("{summary} (warning: reindex task failed: {e})")),

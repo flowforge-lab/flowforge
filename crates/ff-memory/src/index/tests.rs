@@ -1376,3 +1376,76 @@ fn suppress_promotion_survives_reopen_migration() {
     idx.set_suppress_promotion(&key, true).unwrap();
     assert_eq!(read_suppress(&idx, &key), Some(true));
 }
+
+// --- chunk_links graph layer (memory sifting C1, #1293) ---
+
+#[test]
+fn record_link_and_query_by_direction() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.record_link("curated:old", "curated:new", "supersession")
+        .unwrap();
+
+    let from = idx.links_from("curated:old").unwrap();
+    assert_eq!(from.len(), 1);
+    assert_eq!(from[0].to_key, "curated:new");
+    assert_eq!(from[0].kind, "supersession");
+
+    let to = idx.links_to("curated:new").unwrap();
+    assert_eq!(to.len(), 1);
+    assert_eq!(to[0].from_key, "curated:old");
+
+    // No edge in the opposite direction.
+    assert!(idx.links_to("curated:old").unwrap().is_empty());
+    assert!(idx.links_from("curated:new").unwrap().is_empty());
+}
+
+#[test]
+fn record_link_is_idempotent_on_triple() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.record_link_at("a", "b", "supersession", 100).unwrap();
+    idx.record_link_at("a", "b", "supersession", 200).unwrap();
+    let links = idx.links_from("a").unwrap();
+    assert_eq!(
+        links.len(),
+        1,
+        "same (from,to,kind) upserts, not duplicates"
+    );
+    assert_eq!(links[0].created_at, 200, "repeat refreshes created_at");
+
+    // A different kind between the same pair is a distinct edge.
+    idx.record_link("a", "b", "cooccur").unwrap();
+    assert_eq!(idx.links_from("a").unwrap().len(), 2);
+}
+
+#[test]
+fn links_survive_reindex() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks("## A\nalpha", "MEMORY.md")).unwrap();
+    idx.record_link("curated:old", "curated:new", "supersession")
+        .unwrap();
+
+    // A full rebuild (which GCs chunk_stats) must leave chunk_links untouched:
+    // edges describe events, not current content.
+    idx.reindex(&chunks("## B\nbeta", "MEMORY.md")).unwrap();
+
+    let links = idx.links_from("curated:old").unwrap();
+    assert_eq!(links.len(), 1, "edges survive reindex");
+    assert_eq!(links[0].to_key, "curated:new");
+}
+
+#[test]
+fn migration_is_idempotent() {
+    // Re-opening a connection re-runs `CREATE TABLE IF NOT EXISTS chunk_links`
+    // and must not error or lose rows. (open_in_memory is fresh each call, so
+    // drive idempotency via a shared on-disk DB is overkill; re-running from_conn
+    // semantics is exercised by opening twice against the same file below.)
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("index.db");
+    {
+        let idx = Fts5Index::open(&path).unwrap();
+        idx.record_link("a", "b", "supersession").unwrap();
+    }
+    // Second open re-runs the migration; the row must persist.
+    let idx = Fts5Index::open(&path).unwrap();
+    assert_eq!(idx.links_from("a").unwrap().len(), 1);
+}

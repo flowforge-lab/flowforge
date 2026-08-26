@@ -32,7 +32,7 @@ pub use consolidate::{
 pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder, INTERACTIVE_EMBED_TIMEOUT};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
-pub use index::{ChunkStatSnapshot, Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
+pub use index::{ChunkStatSnapshot, Fts5Index, HybridIndex, Link, MemoryIndex, ScoredChunk};
 pub use outcome::{MemoryOutcomeSink, TouchLog, Verdict};
 
 use std::path::{Path, PathBuf};

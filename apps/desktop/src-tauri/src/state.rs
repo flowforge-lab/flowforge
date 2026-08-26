@@ -3970,17 +3970,21 @@ fn open_memory_index(
         // already within budget; runs here (background, off the boot critical path)
         // because consolidate rewrites files and the reindex below is blocking. The
         // rewrite happens before `all_chunks()`, so the single reindex covers it.
+        let mut superseded: Vec<(String, String)> = Vec::new();
         if bg_memory.needs_consolidation() {
             let salience = bg_memory.chunk_stats_salience(bg_index.as_ref(), now_ms());
             match bg_memory.consolidate(&salience) {
-                Ok(report) if report.ran => tracing::info!(
-                    merged = report.merged,
-                    promoted = report.promoted,
-                    demoted = report.demoted,
-                    bytes_before = report.bytes_before,
-                    bytes_after = report.bytes_after,
-                    "startup memory consolidation complete"
-                ),
+                Ok(report) if report.ran => {
+                    tracing::info!(
+                        merged = report.merged,
+                        promoted = report.promoted,
+                        demoted = report.demoted,
+                        bytes_before = report.bytes_before,
+                        bytes_after = report.bytes_after,
+                        "startup memory consolidation complete"
+                    );
+                    superseded = report.superseded;
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "startup memory consolidation failed"),
             }
@@ -3989,6 +3993,11 @@ fn open_memory_index(
         match bg_index.reindex(&chunks) {
             Ok(()) => tracing::info!("memory reindex complete"),
             Err(e) => tracing::warn!(error = %e, "background memory reindex failed"),
+        }
+        // Record supersession edges after reindex, when both endpoint keys are
+        // live in the rebuilt index (memory sifting C1, #1293).
+        for (from, to) in &superseded {
+            let _ = bg_index.record_link(from, to, "supersession");
         }
     });
     #[cfg(not(test))]
