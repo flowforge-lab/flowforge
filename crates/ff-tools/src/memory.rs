@@ -524,7 +524,8 @@ impl Tool for MemoryConsolidateTool {
         let salience = self
             .memory
             .chunk_stats_salience(self.index.as_ref(), Utc::now().timestamp_millis());
-        let report = match self.memory.consolidate(&salience) {
+        let salience_index = self.index.as_ref();
+        let report = match self.memory.consolidate(&salience, Some(salience_index)) {
             Ok(r) => r,
             Err(e) => return ToolOutcome::error(format!("consolidation failed: {e}")),
         };
@@ -537,20 +538,18 @@ impl Tool for MemoryConsolidateTool {
         // make a blocking embedding HTTP call, so run it off the async worker
         // (mirrors `memory_write`); it degrades to BM25 internally on failure.
         let index = self.index.clone();
+        let memory = self.memory.clone();
         let chunks = self.memory.all_chunks();
         let summary = format!(
             "Consolidated: merged {}, promoted {}, demoted {} ({} -> {} bytes).",
             report.merged, report.promoted, report.demoted, report.bytes_before, report.bytes_after
         );
-        let superseded = report.superseded.clone();
         match tokio::task::spawn_blocking(move || {
             index.reindex(&chunks)?;
             // Record supersession edges after reindex, when both endpoint keys are
             // live in the rebuilt index (memory sifting C1, #1293). Edges describe
-            // events, so reindex never GCs them.
-            for (from, to) in &superseded {
-                index.record_link(from, to, "supersession")?;
-            }
+            // events, so reindex never GCs them. Best-effort, owned by ff-memory.
+            memory.record_supersession_edges(index.as_ref(), &report);
             Ok::<(), ff_memory::MemoryError>(())
         })
         .await

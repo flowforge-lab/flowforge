@@ -125,7 +125,9 @@ fn consolidate_merges_duplicate_curated_facts() {
     m.rewrite_curated("# Prefs\nlikes rust\n\n# Prefs\nlikes rust\n")
         .unwrap();
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.merged, 1, "the duplicate section should collapse");
     assert!(report.ran);
@@ -146,7 +148,9 @@ fn consolidate_promotes_recurring_daily_fact() {
         write_daily(&m, days_ago(n), "# Project\nuses tauri\n");
     }
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(
         report.promoted, 1,
@@ -166,7 +170,9 @@ fn consolidate_skips_one_off_daily_fact() {
     let m = mem_with(dir.path(), 4096, true);
     write_daily(&m, days_ago(0), "# One\nseen once\n");
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.promoted, 0, "a one-off fact stays in the daily log");
     assert!(!report.ran);
@@ -179,7 +185,9 @@ fn consolidate_demotes_to_daily_when_over_budget() {
     m.rewrite_curated("# A\nalpha fact\n\n# B\nbeta fact\n\n# C\ngamma fact\n")
         .unwrap();
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert!(report.demoted >= 1, "over-budget curated should demote");
     assert!(report.ran);
@@ -199,7 +207,9 @@ fn consolidate_demote_gated_off_by_config() {
     let curated = "# A\nalpha fact\n\n# B\nbeta fact\n\n# C\ngamma fact\n";
     m.rewrite_curated(curated).unwrap();
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.demoted, 0, "eviction is disabled");
     assert!(
@@ -216,11 +226,15 @@ fn consolidate_is_idempotent() {
     m.rewrite_curated("# Prefs\nlikes rust\n\n# Prefs\nlikes rust\n")
         .unwrap();
 
-    let first = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let first = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
     assert!(first.ran);
     let after_first = std::fs::read_to_string(m.curated_path()).unwrap();
 
-    let second = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let second = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
     assert!(!second.ran, "re-run must be a no-op");
     assert_eq!(second.merged + second.promoted + second.demoted, 0);
     assert_eq!(
@@ -313,7 +327,9 @@ fn consolidate_groups_scattered_strata_into_canonical_shape() {
     )
     .unwrap();
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
     assert!(report.ran, "a scattered curated file should regroup");
 
     let curated = std::fs::read_to_string(m.curated_path()).unwrap();
@@ -324,7 +340,9 @@ fn consolidate_groups_scattered_strata_into_canonical_shape() {
     assert_eq!(curated.matches("## Identity").count(), 1);
 
     // Second run: already grouped -> no-op.
-    let second = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let second = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
     assert!(!second.ran, "re-run on grouped file must be a no-op");
     assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), curated);
 }
@@ -341,7 +359,9 @@ fn consolidate_disabled_is_noop() {
         .unwrap();
     let before = std::fs::read_to_string(m.curated_path()).unwrap();
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert!(!report.ran);
     assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), before);
@@ -371,7 +391,9 @@ fn consolidate_coalesces_windowed_section_without_duplication() {
 
     // Already canonical and whole: the windowed read must not be mistaken
     // for a regroup, and nothing may be duplicated.
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
     assert!(
         !report.ran,
         "a whole, already-grouped section must be a no-op even when windowed"
@@ -392,7 +414,9 @@ fn consolidate_coalesces_windowed_section_without_duplication() {
     assert_eq!(max_dup, 1, "no fact line may appear more than once");
 
     // Re-run is a fixpoint.
-    let second = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let second = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
     assert!(
         !second.ran,
         "re-run on the windowed section must stay a no-op"
@@ -450,7 +474,7 @@ fn demote_evicts_dormant_curated_with_chunk_stats_salience() {
     reinforce_curated_chunk(&idx, &m, "gamma fact", past);
 
     let salience = m.chunk_stats_salience(&idx, now_ms);
-    let report = m.consolidate(&salience).unwrap();
+    let report = m.consolidate(&salience, None).unwrap();
 
     assert_eq!(report.demoted, 1, "exactly one over-budget chunk demoted");
     let curated = std::fs::read_to_string(m.curated_path()).unwrap();
@@ -475,7 +499,9 @@ fn demote_with_mechanical_salience_evicts_array_first_not_dormant() {
     m.rewrite_curated("# A\nalpha fact\n\n# B\nbeta fact\n\n# C\ngamma fact\n")
         .unwrap();
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.demoted, 1);
     let curated = std::fs::read_to_string(m.curated_path()).unwrap();
@@ -549,7 +575,9 @@ fn consolidate_records_supersession_when_heading_uniquely_matches() {
         write_daily(&m, days_ago(n), "# Project\nnew approach\n");
     }
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.promoted, 1);
     assert_eq!(
@@ -560,16 +588,80 @@ fn consolidate_records_supersession_when_heading_uniquely_matches() {
 
     // from = old curated key, to = new promoted (now-curated) key; they differ
     // (different text) and are both curated-sourced.
-    let (old_key, new_key) = report.superseded[0].clone();
+    let Supersession {
+        superseded_key: old_key,
+        superseded_by: new_key,
+    } = report.superseded[0].clone();
     assert_ne!(old_key, new_key);
     assert!(old_key.starts_with("curated:"), "from key: {old_key}");
     assert!(new_key.starts_with("curated:"), "to key: {new_key}");
 
-    // Recording the edge (as the caller does) is queryable in both directions.
+    // Recording the edges via the ff-memory seam is queryable in both directions.
     let idx = Fts5Index::open_in_memory().unwrap();
-    idx.record_link(&old_key, &new_key, "supersession").unwrap();
+    let recorded = m.record_supersession_edges(&idx, &report);
+    assert_eq!(recorded, 1);
     assert_eq!(idx.links_from(&old_key).unwrap()[0].to_key, new_key);
     assert_eq!(idx.links_to(&new_key).unwrap()[0].from_key, old_key);
+}
+
+#[test]
+fn consolidate_supersedes_chunk_present_in_index_but_absent_from_batch() {
+    // Spec (#1293): detection must query the full index, not just this batch. An
+    // old curated fact that lingers in the index but has fallen out of the
+    // current curated file (e.g. demoted, then the same topic re-promoted) is
+    // still a valid supersession target.
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+
+    // The index holds an old curated fact under a distinctive heading, but the
+    // on-disk curated file (this pass's batch) does NOT contain it.
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let old = MemoryChunk {
+        id: 0,
+        source: crate::MemorySource::Curated,
+        path: m.curated_path(),
+        heading: Some("Project".to_string()),
+        text: "# Project\nold approach\n".to_string(),
+        line_start: 1,
+        line_end: 2,
+        embedding: None,
+    };
+    idx.reindex(std::slice::from_ref(&old)).unwrap();
+    let old_key = chunk_key(&old);
+
+    // Curated file is empty; a recurring daily fact under the same heading.
+    m.rewrite_curated("").unwrap();
+    for n in 0..3 {
+        write_daily(&m, days_ago(n), "# Project\nnew approach\n");
+    }
+
+    // Batch-only detection (None) cannot see the old fact -> no edge.
+    let batch_only = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
+    assert_eq!(batch_only.promoted, 1);
+    assert!(
+        batch_only.superseded.is_empty(),
+        "batch-local detection cannot see the index-only fact"
+    );
+
+    // Re-stage and run again, this time consulting the index -> edge is found.
+    m.rewrite_curated("").unwrap();
+    for n in 0..3 {
+        write_daily(&m, days_ago(n), "# Project\nnew approach\n");
+    }
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), Some(&idx))
+        .unwrap();
+
+    assert_eq!(
+        report.superseded.len(),
+        1,
+        "index-wide match yields the edge"
+    );
+    let edge = &report.superseded[0];
+    assert_eq!(edge.superseded_key, old_key);
+    assert_ne!(edge.superseded_by, old_key);
 }
 
 #[test]
@@ -583,7 +675,9 @@ fn consolidate_skips_supersession_when_heading_is_ambiguous() {
         write_daily(&m, days_ago(n), "# Notes\nthird note\n");
     }
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.promoted, 1);
     assert!(
@@ -621,7 +715,9 @@ fn consolidate_skips_supersession_for_stratum_container_heading() {
         write_daily(&m, days_ago(n), "## Focus\n- shipping C2\n");
     }
 
-    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+    let report = m
+        .consolidate(&RecencyFrequencySalience::default(), None)
+        .unwrap();
 
     assert_eq!(report.promoted, 1);
     assert!(

@@ -3970,10 +3970,10 @@ fn open_memory_index(
         // already within budget; runs here (background, off the boot critical path)
         // because consolidate rewrites files and the reindex below is blocking. The
         // rewrite happens before `all_chunks()`, so the single reindex covers it.
-        let mut superseded: Vec<(String, String)> = Vec::new();
+        let mut consolidation: Option<ff_memory::ConsolidationReport> = None;
         if bg_memory.needs_consolidation() {
             let salience = bg_memory.chunk_stats_salience(bg_index.as_ref(), now_ms());
-            match bg_memory.consolidate(&salience) {
+            match bg_memory.consolidate(&salience, Some(bg_index.as_ref())) {
                 Ok(report) if report.ran => {
                     tracing::info!(
                         merged = report.merged,
@@ -3983,7 +3983,7 @@ fn open_memory_index(
                         bytes_after = report.bytes_after,
                         "startup memory consolidation complete"
                     );
-                    superseded = report.superseded;
+                    consolidation = Some(report);
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "startup memory consolidation failed"),
@@ -3995,9 +3995,10 @@ fn open_memory_index(
             Err(e) => tracing::warn!(error = %e, "background memory reindex failed"),
         }
         // Record supersession edges after reindex, when both endpoint keys are
-        // live in the rebuilt index (memory sifting C1, #1293).
-        for (from, to) in &superseded {
-            let _ = bg_index.record_link(from, to, "supersession");
+        // live in the rebuilt index (memory sifting C1, #1293). Owned by
+        // ff-memory, best-effort.
+        if let Some(report) = &consolidation {
+            bg_memory.record_supersession_edges(bg_index.as_ref(), report);
         }
     });
     #[cfg(not(test))]

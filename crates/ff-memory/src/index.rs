@@ -255,6 +255,16 @@ pub trait MemoryIndex: Send + Sync {
     fn links_to(&self, _key: &str) -> Result<Vec<Link>> {
         Ok(Vec::new())
     }
+    /// All currently-indexed curated chunks (`source = 'curated'`), so
+    /// supersession detection can match a promotion against the full committed
+    /// curated set — not just the batch handed to [`Memory::consolidate`] this
+    /// pass (memory sifting C1, #1293). A chunk demoted-then-re-promoted, or one
+    /// present in the index but absent from the current in-memory batch, is
+    /// still a valid supersession target. The default is empty so backends
+    /// without a chunks table need no change; [`Fts5Index`] overrides it.
+    fn curated_chunks(&self) -> Result<Vec<MemoryChunk>> {
+        Ok(Vec::new())
+    }
 }
 
 /// FTS5/BM25 index over a SQLite database. `open` on a path persists to disk;
@@ -329,6 +339,11 @@ impl Fts5Index {
                  last_mapped INTEGER NOT NULL,
                  PRIMARY KEY (content_key, chunk_key)
              );
+             -- Directed edge graph over chunk keys (memory sifting, #1293). `kind`
+             -- is one of three values: 'supersession' (C1: from=older fact,
+             -- to=the promotion that replaced it), 'wikilink', or 'cooccur'
+             -- (both C2). Kept as free TEXT rather than a CHECK constraint so a
+             -- new edge kind needs no migration; writers pass a fixed literal.
              CREATE TABLE IF NOT EXISTS chunk_links (
                  from_key   TEXT NOT NULL,
                  to_key     TEXT NOT NULL,
@@ -779,19 +794,62 @@ impl Fts5Index {
         Ok(())
     }
 
-    fn query_links(&self, column: &str, key: &str) -> Result<Vec<Link>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
+    /// Edges whose `from_key` is `key` (outgoing). SQL is a compile-time literal
+    /// with the column fixed — no identifier is interpolated from a caller.
+    fn query_links_from(&self, key: &str) -> Result<Vec<Link>> {
+        self.query_links(
             "SELECT from_key, to_key, kind, created_at FROM chunk_links
-             WHERE {column} = ?1 ORDER BY created_at DESC, kind, from_key, to_key"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+             WHERE from_key = ?1 ORDER BY created_at DESC, kind, from_key, to_key",
+            key,
+        )
+    }
+
+    /// Edges whose `to_key` is `key` (incoming). SQL is a compile-time literal
+    /// with the column fixed — no identifier is interpolated from a caller.
+    fn query_links_to(&self, key: &str) -> Result<Vec<Link>> {
+        self.query_links(
+            "SELECT from_key, to_key, kind, created_at FROM chunk_links
+             WHERE to_key = ?1 ORDER BY created_at DESC, kind, from_key, to_key",
+            key,
+        )
+    }
+
+    fn query_links(&self, sql: &str, key: &str) -> Result<Vec<Link>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params![key], |row| {
             Ok(Link {
                 from_key: row.get(0)?,
                 to_key: row.get(1)?,
                 kind: row.get(2)?,
                 created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// All curated chunks currently in the index (memory sifting C1, #1293).
+    /// Backs [`MemoryIndex::curated_chunks`]; `embedding` is left `None` since
+    /// supersession detection only needs source + heading + text to key.
+    fn curated_chunks_query(&self) -> Result<Vec<MemoryChunk>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, path, heading, text, line_start, line_end
+             FROM chunks WHERE source = 'curated'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let source: String = row.get(1)?;
+            let path: String = row.get(2)?;
+            Ok(MemoryChunk {
+                id: row.get(0)?,
+                source: source_from_str(&source),
+                path: PathBuf::from(path),
+                heading: row.get(3)?,
+                text: row.get(4)?,
+                line_start: row.get(5)?,
+                line_end: row.get(6)?,
+                embedding: None,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1114,10 +1172,13 @@ impl MemoryIndex for Fts5Index {
         self.record_link_at(from_key, to_key, kind, Utc::now().timestamp_millis())
     }
     fn links_from(&self, key: &str) -> Result<Vec<Link>> {
-        self.query_links("from_key", key)
+        self.query_links_from(key)
     }
     fn links_to(&self, key: &str) -> Result<Vec<Link>> {
-        self.query_links("to_key", key)
+        self.query_links_to(key)
+    }
+    fn curated_chunks(&self) -> Result<Vec<MemoryChunk>> {
+        self.curated_chunks_query()
     }
 }
 
@@ -1290,6 +1351,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn links_to(&self, key: &str) -> Result<Vec<Link>> {
         self.inner.links_to(key)
+    }
+
+    fn curated_chunks(&self) -> Result<Vec<MemoryChunk>> {
+        self.inner.curated_chunks()
     }
 
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {
