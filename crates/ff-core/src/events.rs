@@ -473,6 +473,10 @@ pub struct SessionTitleUpdatedEvent {
 pub struct OutcomeSignal {
     pub session_id: String,
     pub status: SessionStatus,
+    /// Daily `chunk_key`s the session touched, for the signal pipeline to settle
+    /// memory (#1307). Carried on the signal so the consumer need not look up
+    /// session state by `session_id`; typically <100 keys per session.
+    pub touched: Vec<String>,
 }
 
 /// Backend -> frontend request to approve installing a skill (M3.2). Emitted after
