@@ -10,7 +10,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "//build:local": "Local production bundle WITHOUT the signed updater artifact, so it builds without TAURI_SIGNING_PRIVATE_KEY. On macOS, ad-hoc codesigns the .app (unsigned installs often blank the webview). Prefer ./scripts/dev-install.sh to also replace /Applications. See docs/SOP-rust-setup.md \u00a75 / \u00a78.",
+    "//build:local": "Local production bundle WITHOUT the signed updater artifact, so it builds without TAURI_SIGNING_PRIVATE_KEY. On macOS, ad-hoc codesigns the .app (unsigned installs often blank the webview). Prefer ./scripts/dev-install.sh to also replace /Applications. See docs/SOP-rust-setup.md §5 / §8.",
     "build:local": "tauri build --config src-tauri/tauri.no-updater-sign.conf.json && sh ../../scripts/codesign-local-macos.sh",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",

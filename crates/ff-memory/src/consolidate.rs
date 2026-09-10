@@ -265,6 +265,25 @@ pub struct ConsolidationReport {
     pub bytes_before: usize,
     /// Curated file size after the pass (== `bytes_before` when `!ran`).
     pub bytes_after: usize,
+    /// Supersession edges detected this pass (memory sifting C1, #1293). Each
+    /// entry says one older curated fact was replaced by a freshly promoted one
+    /// under the same distinctive heading. [`Memory::record_supersession_edges`]
+    /// writes these into `chunk_links` after reindex, once both keys are live.
+    /// Empty unless a promotion uniquely matched exactly one same-heading fact.
+    pub superseded: Vec<Supersession>,
+}
+
+/// A detected supersession relationship between two curated chunks (memory
+/// sifting C1, #1293): the fact keyed `superseded_key` was replaced by the
+/// freshly promoted fact keyed `superseded_by`, under the same distinctive
+/// heading. Recorded as a directed `chunk_links` edge `from = superseded_key`,
+/// `to = superseded_by` (old → new) by [`Memory::record_supersession_edges`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supersession {
+    /// Chunk key of the older curated fact that was superseded (edge `from`).
+    pub superseded_key: String,
+    /// Chunk key of the freshly promoted fact that supersedes it (edge `to`).
+    pub superseded_by: String,
 }
 
 /// Map a chunk's (stripped) heading to a canonical [`Stratum`], if it is one.
@@ -434,7 +453,19 @@ impl crate::Memory {
     ///
     /// Does **not** reindex: the caller owns the index (and the blocking embed
     /// call it may make). See `MemoryConsolidateTool`.
-    pub fn consolidate(&self, salience: &dyn Salience<MemoryChunk>) -> Result<ConsolidationReport> {
+    ///
+    /// `index` is consulted read-only during supersession detection (memory
+    /// sifting C1, #1293): a promotion is matched against the full committed
+    /// curated set, not just this pass's batch, so a fact that was
+    /// demoted-then-re-promoted (present in the index but absent from the
+    /// in-memory `all_chunks()` view) still yields a supersession edge. Pass
+    /// `None` to restrict detection to the current batch (backends with no
+    /// `chunk_links` layer, and unit tests that don't exercise supersession).
+    pub fn consolidate(
+        &self,
+        salience: &dyn Salience<MemoryChunk>,
+        index: Option<&dyn crate::index::MemoryIndex>,
+    ) -> Result<ConsolidationReport> {
         let bytes_before = std::fs::metadata(self.curated_path())
             .map(|m| m.len())
             .unwrap_or(0) as usize;
@@ -482,6 +513,42 @@ impl crate::Memory {
         let mut curated = kept;
         let curated_keys: HashSet<String> = curated.iter().map(content_key).collect();
 
+        // Supersession detection (memory sifting C1, #1293). Map each distinctive
+        // heading to the curated chunk keys under it, so a promotion whose heading
+        // matches exactly one existing curated fact can be recorded as superseding
+        // it. Canonical stratum headings (Identity/Patterns/Focus) are structural
+        // containers for bare bullets, not topics, so they are excluded -- only a
+        // distinctive sub-heading names "the same thing".
+        //
+        // The batch (`curated`) is the in-memory view; the index (when provided)
+        // holds the full committed curated set. Seed from both and dedup by key,
+        // so a fact that lingers in the index but fell out of this batch (e.g.
+        // demoted then re-promoted) is still a valid supersession target (Spec:
+        // detection must query the full index, not just this batch).
+        let mut curated_by_heading: HashMap<String, Vec<String>> = HashMap::new();
+        let mut seen_heading_keys: HashSet<(String, String)> = HashSet::new();
+        let mut index_by_heading = |chunk: &MemoryChunk| {
+            if let Some(h) = chunk.heading.as_deref() {
+                if stratum_for_heading(h).is_none() {
+                    let key = chunk_key(chunk);
+                    if seen_heading_keys.insert((h.to_string(), key.clone())) {
+                        curated_by_heading
+                            .entry(h.to_string())
+                            .or_default()
+                            .push(key);
+                    }
+                }
+            }
+        };
+        for c in &curated {
+            index_by_heading(c);
+        }
+        if let Some(index) = index {
+            for c in index.curated_chunks()? {
+                index_by_heading(&c);
+            }
+        }
+
         // --- Promote: recurring, recent daily facts not already curated. Pick
         //     the highest-scoring (freshest) copy per content key. ---
         let mut best: HashMap<String, (f32, MemoryChunk)> = HashMap::new();
@@ -506,6 +573,24 @@ impl crate::Memory {
         for key in promoted_keys {
             let (_, mut chunk) = best.remove(&key).unwrap();
             chunk.source = MemorySource::Curated;
+            // Supersession: if this promotion's heading matches exactly one
+            // existing curated fact (1:1 guard), record the old fact as superseded
+            // by the new one. Ambiguous headings (>1 curated chunk) are skipped --
+            // we cannot tell which was replaced, so never mis-record. The
+            // promotion's own key is excluded so a re-promotion never supersedes
+            // itself.
+            let new_key = chunk_key(&chunk);
+            if let Some(h) = chunk.heading.as_deref() {
+                if let Some(olds) = curated_by_heading.get(h) {
+                    let candidates: Vec<&String> = olds.iter().filter(|k| **k != new_key).collect();
+                    if candidates.len() == 1 {
+                        report.superseded.push(Supersession {
+                            superseded_key: candidates[0].clone(),
+                            superseded_by: new_key,
+                        });
+                    }
+                }
+            }
             curated.push(chunk);
             report.promoted += 1;
         }
@@ -545,6 +630,38 @@ impl crate::Memory {
                 .unwrap_or(0) as usize;
         }
         Ok(report)
+    }
+
+    /// Write the supersession edges detected by [`consolidate`](Self::consolidate)
+    /// into the index's `chunk_links` graph layer (memory sifting C1, #1293).
+    ///
+    /// The single owner of this write: shells (desktop, CLI, the consolidate
+    /// tool) call this instead of looping over `report.superseded` themselves,
+    /// keeping the edge-recording rule in `ff-memory` where the domain lives
+    /// (ARCHITECTURE.md: the desktop shell holds no business logic).
+    ///
+    /// Best-effort: call it *after* reindex so both endpoint keys are live in
+    /// `chunks`. A per-edge failure is logged and skipped — a link that cannot
+    /// be recorded never fails consolidation. Returns the number of edges
+    /// successfully written.
+    pub fn record_supersession_edges(
+        &self,
+        index: &dyn crate::index::MemoryIndex,
+        report: &ConsolidationReport,
+    ) -> usize {
+        let mut recorded = 0;
+        for edge in &report.superseded {
+            match index.record_link(&edge.superseded_key, &edge.superseded_by, "supersession") {
+                Ok(()) => recorded += 1,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    from = %edge.superseded_key,
+                    to = %edge.superseded_by,
+                    "failed to record supersession edge"
+                ),
+            }
+        }
+        recorded
     }
 }
 
