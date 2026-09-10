@@ -255,6 +255,13 @@ pub trait MemoryIndex: Send + Sync {
     fn links_to(&self, _key: &str) -> Result<Vec<Link>> {
         Ok(Vec::new())
     }
+    /// Fetch the chunks whose derived [`chunk_key`] is in `keys`, in no
+    /// guaranteed order. Powers one-hop neighbourhood expansion (memory sifting
+    /// C2, #1294): a linked-but-below-cut chunk is materialised by its key.
+    /// The default is empty so key-less backends need no change.
+    fn chunks_by_keys(&self, _keys: &[String]) -> Result<Vec<MemoryChunk>> {
+        Ok(Vec::new())
+    }
     /// All currently-indexed curated chunks (`source = 'curated'`), so
     /// supersession detection can match a promotion against the full committed
     /// curated set — not just the batch handed to [`Memory::consolidate`] this
@@ -855,6 +862,43 @@ impl Fts5Index {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    /// Materialise chunks by their derived [`chunk_key`](crate::consolidate::chunk_key).
+    /// Backs [`MemoryIndex::chunks_by_keys`] for one-hop expansion (C2, #1294).
+    /// Keys are content-derived, not a stored column, so this scans the chunk
+    /// table and filters by recomputing each row's key. The result set is the
+    /// requested keys that still resolve to a live chunk (order unspecified).
+    fn chunks_by_keys_query(&self, keys: &[String]) -> Result<Vec<MemoryChunk>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, source, path, heading, text, line_start, line_end FROM chunks")?;
+        let rows = stmt.query_map([], |row| {
+            let source: String = row.get(1)?;
+            let path: String = row.get(2)?;
+            Ok(MemoryChunk {
+                id: row.get(0)?,
+                source: source_from_str(&source),
+                path: PathBuf::from(path),
+                heading: row.get(3)?,
+                text: row.get(4)?,
+                line_start: row.get(5)?,
+                line_end: row.get(6)?,
+                embedding: None,
+            })
+        })?;
+        let mut out = Vec::new();
+        for chunk in rows {
+            let chunk = chunk?;
+            if wanted.contains(crate::consolidate::chunk_key(&chunk).as_str()) {
+                out.push(chunk);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl MemoryIndex for Fts5Index {
@@ -1177,6 +1221,9 @@ impl MemoryIndex for Fts5Index {
     fn links_to(&self, key: &str) -> Result<Vec<Link>> {
         self.query_links_to(key)
     }
+    fn chunks_by_keys(&self, keys: &[String]) -> Result<Vec<MemoryChunk>> {
+        self.chunks_by_keys_query(keys)
+    }
     fn curated_chunks(&self) -> Result<Vec<MemoryChunk>> {
         self.curated_chunks_query()
     }
@@ -1351,6 +1398,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn links_to(&self, key: &str) -> Result<Vec<Link>> {
         self.inner.links_to(key)
+    }
+
+    fn chunks_by_keys(&self, keys: &[String]) -> Result<Vec<MemoryChunk>> {
+        self.inner.chunks_by_keys(keys)
     }
 
     fn curated_chunks(&self) -> Result<Vec<MemoryChunk>> {

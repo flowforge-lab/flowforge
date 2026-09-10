@@ -2593,10 +2593,14 @@ impl DesktopTaskRunner {
                     if report.ran {
                         // Best-effort reindex; a recall-cache failure must not fail
                         // the consolidation pass itself.
-                        let _ = index.reindex(&memory.all_chunks());
+                        let chunks = memory.all_chunks();
+                        let _ = index.reindex(&chunks);
                         // Record supersession edges after reindex (#1293); owned
                         // by ff-memory, best-effort.
                         memory.record_supersession_edges(index.as_ref(), &report);
+                        // Record model-free structural edges (wiki-link +
+                        // co-occurrence) over the rebuilt set (#1294); best-effort.
+                        memory.record_graph_edges(index.as_ref(), &chunks);
                     }
                     ff_memory::Result::Ok(())
                 })

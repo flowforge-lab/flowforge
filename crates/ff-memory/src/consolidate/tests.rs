@@ -725,3 +725,128 @@ fn consolidate_skips_supersession_for_stratum_container_heading() {
         "stratum container heading is not a supersession signal"
     );
 }
+
+// --- model-free graph edges: wiki-link + co-occurrence (memory sifting C2, #1294) ---
+
+#[test]
+fn cooccur_edge_between_chunks_sharing_an_identifier() {
+    // AC (#1294): two chunks that share an extracted identifier get a `cooccur`
+    // edge, deterministically and with no model call.
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    m.rewrite_curated(
+        "# Alpha\nThe SignalStore ingests events.\n\n# Beta\nWe flush the SignalStore nightly.\n",
+    )
+    .unwrap();
+
+    let chunks = m.all_chunks();
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks).unwrap();
+
+    let recorded = m.record_graph_edges(&idx, &chunks);
+    assert!(
+        recorded >= 1,
+        "expected at least the SignalStore cooccur edge"
+    );
+
+    let alpha = chunks
+        .iter()
+        .find(|c| c.heading.as_deref() == Some("Alpha"))
+        .unwrap();
+    let beta = chunks
+        .iter()
+        .find(|c| c.heading.as_deref() == Some("Beta"))
+        .unwrap();
+    let (ak, bk) = (chunk_key(alpha), chunk_key(beta));
+
+    let edges: Vec<_> = idx
+        .links_from(&ak)
+        .unwrap()
+        .into_iter()
+        .chain(idx.links_to(&ak).unwrap())
+        .filter(|l| l.kind == "cooccur")
+        .collect();
+    assert!(
+        edges.iter().any(|l| l.from_key == bk || l.to_key == bk),
+        "Alpha and Beta must be linked by a cooccur edge; got {edges:?}"
+    );
+}
+
+#[test]
+fn wikilink_edge_resolves_to_heading() {
+    // AC (#1294): an explicit `[[target]]` becomes a `wikilink` edge to the chunk
+    // whose heading matches the target (case-insensitive).
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    m.rewrite_curated("# Source\nSee [[Target]] for details.\n\n# Target\nThe destination fact.\n")
+        .unwrap();
+
+    let chunks = m.all_chunks();
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks).unwrap();
+    m.record_graph_edges(&idx, &chunks);
+
+    let source = chunks
+        .iter()
+        .find(|c| c.heading.as_deref() == Some("Source"))
+        .unwrap();
+    let target = chunks
+        .iter()
+        .find(|c| c.heading.as_deref() == Some("Target"))
+        .unwrap();
+    let (sk, tk) = (chunk_key(source), chunk_key(target));
+
+    let wl: Vec<_> = idx
+        .links_from(&sk)
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.kind == "wikilink")
+        .collect();
+    assert_eq!(wl.len(), 1, "one wikilink edge from Source; got {wl:?}");
+    assert_eq!(wl[0].to_key, tk, "wikilink must point at the Target chunk");
+}
+
+#[test]
+fn chunks_by_keys_round_trips_derived_keys() {
+    // One-hop expansion needs to materialise a chunk from its derived key.
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    m.rewrite_curated("# One\nfirst\n\n# Two\nsecond\n")
+        .unwrap();
+    let chunks = m.all_chunks();
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks).unwrap();
+
+    let key = chunk_key(&chunks[0]);
+    let got = idx.chunks_by_keys(std::slice::from_ref(&key)).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(chunk_key(&got[0]), key);
+
+    assert!(idx.chunks_by_keys(&[]).unwrap().is_empty());
+    assert!(idx
+        .chunks_by_keys(&["curated:Nope:deadbeef".into()])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn record_graph_edges_is_idempotent_and_skips_self_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 4096, false);
+    m.rewrite_curated("# A\nMemoryIndex here.\n\n# B\nMemoryIndex there.\n")
+        .unwrap();
+    let chunks = m.all_chunks();
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks).unwrap();
+
+    let first = m.record_graph_edges(&idx, &chunks);
+    let ak = chunk_key(&chunks[0]);
+    let before = idx.links_from(&ak).unwrap().len() + idx.links_to(&ak).unwrap().len();
+    // Second pass records no *new* rows (idempotent triple upsert).
+    let _ = m.record_graph_edges(&idx, &chunks);
+    let after = idx.links_from(&ak).unwrap().len() + idx.links_to(&ak).unwrap().len();
+    assert_eq!(before, after, "re-running must not duplicate edges");
+    assert!(first >= 1);
+    // No self-edge.
+    assert!(idx.links_from(&ak).unwrap().iter().all(|l| l.to_key != ak));
+}
