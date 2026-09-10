@@ -663,6 +663,82 @@ impl crate::Memory {
         }
         recorded
     }
+
+    /// Build the two **model-free** structural edge kinds (memory sifting C2,
+    /// #1294) over the full chunk set and record them into `chunk_links`:
+    ///
+    /// - `"wikilink"` — for each `[[target]]` authored in a chunk, an edge to the
+    ///   chunk whose heading matches `target` (case-insensitive). Self-links and
+    ///   unresolved targets are skipped.
+    /// - `"cooccur"` — an undirected edge (recorded as an ordered pair, low→high
+    ///   key, to keep the idempotent triple stable) between any two chunks that
+    ///   share at least one extracted identifier ([`links::extract_identifiers`]).
+    ///
+    /// Deterministic and no model call ([`links`] extracts purely from text).
+    /// Best-effort like [`record_supersession_edges`](Self::record_supersession_edges):
+    /// call it *after* reindex so both endpoint keys are live; an edge failure is
+    /// logged and never aborts the pass. Returns the number of edges recorded.
+    pub fn record_graph_edges(
+        &self,
+        index: &dyn crate::index::MemoryIndex,
+        chunks: &[MemoryChunk],
+    ) -> usize {
+        use crate::links;
+
+        let keys: Vec<String> = chunks.iter().map(chunk_key).collect();
+
+        // Heading -> chunk key, for wiki-link target resolution. Later chunks
+        // win a heading collision (arbitrary but deterministic by iteration).
+        let mut by_heading: HashMap<String, &str> = HashMap::new();
+        for (chunk, key) in chunks.iter().zip(&keys) {
+            if let Some(h) = &chunk.heading {
+                by_heading.insert(h.to_ascii_lowercase(), key.as_str());
+            }
+        }
+
+        let mut recorded = 0;
+        let mut record = |from: &str, to: &str, kind: &str| {
+            if from == to {
+                return;
+            }
+            match index.record_link(from, to, kind) {
+                Ok(()) => recorded += 1,
+                Err(e) => tracing::warn!(error = %e, from, to, kind, "failed to record graph edge"),
+            }
+        };
+
+        // (a) wiki-link edges.
+        for (chunk, from_key) in chunks.iter().zip(&keys) {
+            for target in links::parse_wikilinks(&chunk.text) {
+                if let Some(to_key) = by_heading.get(target.to_ascii_lowercase().as_str()) {
+                    record(from_key, to_key, "wikilink");
+                }
+            }
+        }
+
+        // (b) co-occurrence edges: invert identifier -> chunk-key, then connect
+        //     every pair sharing an identifier. The inverted index keeps this
+        //     O(sum of postings^2) rather than O(chunks^2) over the whole corpus.
+        let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            for ident in links::extract_identifiers(&chunk.text) {
+                postings.entry(ident).or_default().push(i);
+            }
+        }
+        let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
+        for idxs in postings.values() {
+            for (a_pos, &a) in idxs.iter().enumerate() {
+                for &b in &idxs[a_pos + 1..] {
+                    let (lo, hi) = if keys[a] <= keys[b] { (a, b) } else { (b, a) };
+                    if keys[lo] != keys[hi] && seen_pairs.insert((lo, hi)) {
+                        record(&keys[lo], &keys[hi], "cooccur");
+                    }
+                }
+            }
+        }
+
+        recorded
+    }
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ mod embed;
 mod error;
 pub mod flush;
 pub mod index;
+pub mod links;
 pub mod outcome;
 pub mod watch;
 

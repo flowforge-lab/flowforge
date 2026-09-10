@@ -14,7 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ff_memory::{
-    chunk_key, chunk_markdown, Memory, MemoryIndex, MemorySource, ScoredChunk, Stratum, WriteTarget,
+    chunk_key, chunk_markdown, Memory, MemoryChunk, MemoryIndex, MemorySource, ScoredChunk,
+    Stratum, WriteTarget,
 };
 use serde_json::Value;
 
@@ -80,7 +81,66 @@ pub fn format_hits(memory: &Memory, hits: &[ScoredChunk]) -> String {
     out.trim_end().to_string()
 }
 
-/// Coarse human-readable age for a positive epoch-ms delta, e.g. `6 months ago`.
+/// Collect the one-hop graph neighbours of the ranked `hits` (memory sifting C2,
+/// #1294): every chunk reachable by an outbound or inbound edge from a hit, that
+/// is not itself already a hit. De-duplicated by `chunk_key`, order stable
+/// (hit order, then edge order). Best-effort — the caller treats an `Err` as
+/// "no neighbours" so a graph-layer failure never breaks ranked recall.
+fn one_hop_neighbours(
+    index: &dyn MemoryIndex,
+    hits: &[ScoredChunk],
+) -> ff_memory::Result<Vec<MemoryChunk>> {
+    let mut neighbour_keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = hits.iter().map(|sc| chunk_key(&sc.chunk)).collect();
+    for sc in hits {
+        let key = chunk_key(&sc.chunk);
+        for link in index
+            .links_from(&key)?
+            .into_iter()
+            .chain(index.links_to(&key)?)
+        {
+            // links_to yields edges *into* `key`; its far end is `from_key`.
+            let other = if link.from_key == key {
+                link.to_key
+            } else {
+                link.from_key
+            };
+            if seen.insert(other.clone()) {
+                neighbour_keys.push(other);
+            }
+        }
+    }
+    index.chunks_by_keys(&neighbour_keys)
+}
+
+/// Render ranked hits followed by their one-hop neighbours under a divider, so
+/// linked-but-below-cut context surfaces without displacing true matches.
+fn format_hits_with_neighbours(
+    memory: &Memory,
+    hits: &[ScoredChunk],
+    neighbours: &[MemoryChunk],
+) -> String {
+    let mut out = format_hits(memory, hits);
+    if neighbours.is_empty() {
+        return out;
+    }
+    out.push_str("\n\n--- linked (one-hop) ---\n");
+    for chunk in neighbours {
+        let path = rel_path(memory, &chunk.path);
+        let heading = chunk
+            .heading
+            .as_deref()
+            .map(|h| format!(" \u{203a} {h}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "[linked] {path}{heading} (lines {}-{})\n{}\n\n",
+            chunk.line_start,
+            chunk.line_end,
+            chunk.text.trim()
+        ));
+    }
+    out.trim_end().to_string()
+}
 /// Used only for the dormant tag, so approximate buckets are fine.
 fn human_age_ms(delta_ms: i64) -> String {
     let days = (delta_ms.max(0) as f64 / 86_400_000.0).floor() as i64;
@@ -177,12 +237,24 @@ impl Tool for MemorySearchTool {
             // stats write must never fail recall. It is a no-op for backends
             // without a chunk_stats table, and weight-neutral when decay is off.
             let _ = index.reinforce(&hits);
-            ff_memory::Result::Ok(hits)
+
+            // One-hop neighbourhood expansion (memory sifting C2, #1294): a chunk
+            // linked to a hit — via a `[[wiki-link]]`, `cooccur`, or supersession
+            // edge — surfaces even if it fell below the search cut. Neighbours are
+            // *appended below* the ranked hits so they never displace a true match,
+            // and are not reinforced (they were not directly recalled). Best-effort:
+            // any graph-layer error leaves the ranked hits untouched.
+            let neighbours = one_hop_neighbours(index.as_ref(), &hits).unwrap_or_default();
+            ff_memory::Result::Ok((hits, neighbours))
         })
         .await
         {
-            Ok(Ok(hits)) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
-            Ok(Ok(hits)) => ToolOutcome::ok(format_hits(&self.memory, &hits)),
+            Ok(Ok((hits, _))) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
+            Ok(Ok((hits, neighbours))) => ToolOutcome::ok(format_hits_with_neighbours(
+                &self.memory,
+                &hits,
+                &neighbours,
+            )),
             Ok(Err(e)) => ToolOutcome::error(format!("memory search failed: {e}")),
             Err(e) => ToolOutcome::error(format!("memory search task failed: {e}")),
         }
@@ -550,6 +622,9 @@ impl Tool for MemoryConsolidateTool {
             // live in the rebuilt index (memory sifting C1, #1293). Edges describe
             // events, so reindex never GCs them. Best-effort, owned by ff-memory.
             memory.record_supersession_edges(index.as_ref(), &report);
+            // Record model-free structural edges (wiki-link + co-occurrence) over
+            // the rebuilt chunk set (memory sifting C2, #1294). Also best-effort.
+            memory.record_graph_edges(index.as_ref(), &chunks);
             Ok::<(), ff_memory::MemoryError>(())
         })
         .await
@@ -1112,5 +1187,72 @@ mod tests {
             .await;
         assert!(out.success);
         assert_eq!(out.content, "(memory is disabled)");
+    }
+
+    #[tokio::test]
+    async fn search_hit_surfaces_one_hop_neighbour() {
+        // AC (#1294): seed two chunks sharing an identifier; a search that hits
+        // only one must surface the other via one-hop expansion.
+        let (_dir, memory, index) = setup();
+        // Two curated chunks share the `SignalStore` identifier; only "Ingest"
+        // mentions the query term "flush" so BM25 hits it alone.
+        memory
+            .rewrite_curated(
+                "## Ingest\nThe SignalStore flush path runs nightly.\n\n\
+                 ## Retention\nSignalStore holds aggregates only.\n",
+            )
+            .unwrap();
+        let chunks = memory.all_chunks();
+        index.reindex(&chunks).unwrap();
+        let recorded = memory.record_graph_edges(index.as_ref(), &chunks);
+        assert!(recorded >= 1, "expected a cooccur edge on SignalStore");
+
+        let search = MemorySearchTool::new(memory.clone(), index.clone());
+        let out = search
+            .run(
+                serde_json::json!({ "query": "flush path nightly" }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(
+            out.content.contains("Ingest"),
+            "direct hit missing: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("linked (one-hop)"),
+            "expected a one-hop section: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Retention") && out.content.contains("aggregates only"),
+            "linked neighbour must surface: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn search_without_edges_has_no_one_hop_section() {
+        let (_dir, memory, index) = setup();
+        memory
+            .rewrite_curated("## Solo\nThe SignalStore flush path runs nightly.\n")
+            .unwrap();
+        index.reindex(&memory.all_chunks()).unwrap();
+
+        let search = MemorySearchTool::new(memory.clone(), index.clone());
+        let out = search
+            .run(
+                serde_json::json!({ "query": "flush path nightly" }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("Solo"), "{}", out.content);
+        assert!(
+            !out.content.contains("linked (one-hop)"),
+            "no edges seeded, so no one-hop section: {}",
+            out.content
+        );
     }
 }
